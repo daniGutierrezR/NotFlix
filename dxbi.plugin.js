@@ -496,6 +496,22 @@
     return { ...parsed, href, title, poster, link };
   }
 
+  // A card's "type:id" ("" when it has none), remembered per card while its link stays the same.
+  // The main loop asks this of every title on the page each pass; only the address matters there
+  // (the title and poster, which can arrive later, come from cardInfo).
+  const cardKeys = new WeakMap();
+  function cardKey(card) {
+    const hit = cardKeys.get(card);
+    if (hit && hit.link.getAttribute("href") === hit.href && card.contains(hit.link)) return hit.key;
+    const link = card.querySelector('a[class*="meta-item-link"]') || card.querySelector("a[href]");
+    if (!link) return "";
+    const href = link.getAttribute("href") || "";
+    const parsed = parseDetailHref(href);
+    const key = parsed ? `${parsed.type}:${parsed.id}` : "";
+    cardKeys.set(card, { link, href, key });
+    return key;
+  }
+
   // Navigate the way Stremio's own links do (pushState, then popstate so its router renders).
   // Setting location.hash directly skips Stremio's history tracking, and its back arrow then
   // stops at a parent page first, so you had to press it twice.
@@ -571,32 +587,79 @@
     }
   }
 
+  // Run `fn` while the page has nothing else to do (soon anyway: `timeout` ms at most)
+  function idle(fn, timeout) {
+    return window.requestIdleCallback ? requestIdleCallback(fn, { timeout }) : setTimeout(fn, Math.min(timeout, 50));
+  }
+
+  // Saved to localStorage while the page is idle: a first visit to Home caches a couple of hundred
+  // titles, and each write holds the page up while it's made. The memory copy is used meanwhile.
+  const unsaved = new Map();
+  let saving = false;
   let writes = 0;
   function writeCached(key, meta) {
     memory.set(key, meta);
     if (memory.size > 1500) memory.delete(memory.keys().next().value);
-    try {
-      localStorage.setItem(META_PREFIX + key, JSON.stringify({ t: Date.now(), m: meta }));
-      if (++writes % 50 === 0) pruneCache(900);
-    } catch (_) {
-      pruneCache(0);
+    unsaved.set(key, { t: Date.now(), m: meta });
+    if (!saving) {
+      saving = true;
+      idle(saveCached, 2000);
     }
   }
+
+  // (without a deadline, as the app closes: everything at once)
+  function saveCached(deadline) {
+    saving = false;
+    for (const [key, entry] of unsaved) {
+      unsaved.delete(key);
+      try {
+        localStorage.setItem(META_PREFIX + key, JSON.stringify(entry));
+        if (cacheIndex) cacheIndex.set(META_PREFIX + key, entry.t);
+        if (++writes % 50 === 0) pruneCache(900);
+      } catch (_) {
+        pruneCache(0);
+      }
+      if (deadline && deadline.timeRemaining && deadline.timeRemaining() < 2) break;
+    }
+    if (unsaved.size && !saving) {
+      saving = true;
+      idle(saveCached, 2000);
+    }
+  }
+
+  // When each cached entry was saved, by storage key: read from storage once (the first time the
+  // cache is trimmed), then kept up to date, rather than reading every entry back each time
+  let cacheIndex = null;
 
   // Keep the cache bounded: drop expired entries, then the oldest beyond `limit`
   function pruneCache(limit) {
     try {
+      if (!cacheIndex) {
+        cacheIndex = new Map();
+        for (const k of Object.keys(localStorage)) {
+          if (!k.startsWith(META_PREFIX)) continue;
+          const raw = localStorage.getItem(k) || "";
+          // saved as {"t":…,"m":…}: the time is read off the front, without parsing the rest
+          const m = /^\{"t":(\d+)/.exec(raw);
+          let t = m ? +m[1] : 0;
+          if (!m) try { t = JSON.parse(raw).t || 0; } catch (_) { /* corrupt entry */ }
+          cacheIndex.set(k, t);
+        }
+      }
+      const now = Date.now();
       const entries = [];
-      for (const k of Object.keys(localStorage)) {
-        if (!k.startsWith(META_PREFIX)) continue;
-        let t = 0;
-        try { t = JSON.parse(localStorage.getItem(k)).t || 0; } catch (_) { /* corrupt entry */ }
-        if (Date.now() - t > META_TTL) localStorage.removeItem(k);
-        else entries.push([k, t]);
+      for (const [k, t] of cacheIndex) {
+        if (now - t > META_TTL) {
+          localStorage.removeItem(k);
+          cacheIndex.delete(k);
+        } else entries.push([k, t]);
       }
       const keep = limit || Math.floor(entries.length / 2);
       entries.sort((a, b) => a[1] - b[1]);
-      entries.slice(0, Math.max(0, entries.length - keep)).forEach(([k]) => localStorage.removeItem(k));
+      for (const [k] of entries.slice(0, Math.max(0, entries.length - keep))) {
+        localStorage.removeItem(k);
+        cacheIndex.delete(k);
+      }
     } catch (_) { /* ignore */ }
   }
 
@@ -779,29 +842,29 @@
     }
   }
 
+  // A gliding row or page sends a scroll event every frame. The hover card closes at once (cheap when
+  // none is open); the rest (the top bar, a row's arrows and page dots) catches up once a frame.
+  const scrolledBoxes = new Set();
   function onScroll(event) {
     const target = event.target;
     if (!(target instanceof Element)) return;
     preview.close(true);
-    keyNav.onScroll();
-    if (target.matches('[class*="board-content-"]:not([class*="board-content-container"]), [class*="discover-content"] [class*="meta-items-container"], [class*="library-content"] [class*="meta-items-container"], [class*="search-content"], [class*="settings-content"] [class*="sections-container"], [class*="addons-list-container"], [class*="calendar"] [class*="content"]')) {
-      setScrolled(target.scrollTop > 8);
-    }
-    if (target.matches('[class*="meta-row"] > [class*="meta-items-container"]')) {
-      arrowsSoon(target.parentElement);
-    }
+    if (!scrolledBoxes.size) requestAnimationFrame(afterScroll);
+    scrolledBoxes.add(target);
   }
 
-  // A gliding row sends a scroll event every frame: its arrows and page dots catch up once a frame
-  const arrowRows = new Set();
-  function arrowsSoon(row) {
-    if (!arrowRows.size) {
-      requestAnimationFrame(() => {
-        for (const r of arrowRows) updateArrows(r);
-        arrowRows.clear();
-      });
+  function afterScroll() {
+    keyNav.onScroll();
+    for (const target of scrolledBoxes) {
+      if (target.matches('[class*="board-content-"]:not([class*="board-content-container"]), [class*="discover-content"] [class*="meta-items-container"], [class*="library-content"] [class*="meta-items-container"], [class*="search-content"], [class*="settings-content"] [class*="sections-container"], [class*="addons-list-container"], [class*="calendar"] [class*="content"]')) {
+        setScrolled(target.scrollTop > 8);
+      }
+      // (a TV has no pointer to show a row's arrows and dots to: see updateAllArrows)
+      if (!IN_TV && target.matches('[class*="meta-row"] > [class*="meta-items-container"]')) {
+        updateArrows(target.parentElement);
+      }
     }
-    arrowRows.add(row);
+    scrolledBoxes.clear();
   }
 
   // ---------------------------------------------------------------------------
@@ -1021,8 +1084,9 @@
   // Carousels (arrows + page dots)
   // ---------------------------------------------------------------------------
 
+  const CAROUSEL_ROW = '[class*="board-content-"]:not([class*="board-content-container"]) [class*="meta-row-container"], [class*="search-content"] [class*="meta-row-container"]';
   function carouselRows() {
-    return document.querySelectorAll('[class*="board-content-"]:not([class*="board-content-container"]) [class*="meta-row-container"], [class*="search-content"] [class*="meta-row-container"]');
+    return document.querySelectorAll(CAROUSEL_ROW);
   }
 
   function enhanceRow(row) {
@@ -1052,6 +1116,10 @@
   function updateAllArrows() {
     const rows = [...carouselRows()];
     rows.forEach(enhanceRow);
+    // TV: the arrows and page dots only show to a pointer resting on the row, and there's none. They
+    // stay (the row's header leaves room for the dots), but measuring every row on each pass forced
+    // the whole page's layout to be worked out again.
+    if (IN_TV) return;
     const sizes = rows.map(measureRow);
     rows.forEach((row, i) => applyArrows(row, sizes[i]));
   }
@@ -1324,7 +1392,6 @@
   }
 
   function syncCards() {
-    coreMeta.refresh();
     // Plain marker attributes instead of CSS :has(): a :has() that looks inside rows makes the
     // browser re-check the whole page on every change there (hover cards, trailers, progress)
     const markWatched = settings.watchedTitles !== "show";
@@ -1336,18 +1403,21 @@
     if (!settings.ratings) document.querySelectorAll('#app [class*="poster-container"] > .dx-badge').forEach((b) => b.remove());
     if (!settings.newEpisodes) document.querySelectorAll("#app .dxe-new-ep").forEach((b) => b.remove());
     if (!settings.animeTitles) document.querySelectorAll("#app .dx-anime-title").forEach((b) => b.remove());
+    const marks = `${settings.ratings}|${settings.newEpisodes}|${settings.animeTitles}|${episodes.version}`;
+    let fresh = false;
     for (const card of allCards()) {
+      const continuing = !!card.closest('[class*="continue-watching-row"]');
       if (markWatched) {
         // Continue Watching is never dimmed or hidden
-        const watched = !card.closest('[class*="continue-watching-row"]') && !!card.querySelector('[class*="watched-icon-layer"]');
+        const watched = !continuing && !!card.querySelector('[class*="watched-icon-layer"]');
         if (watched !== card.hasAttribute("data-dx-watched")) card.toggleAttribute("data-dx-watched", watched);
       }
-      const info = cardInfo(card);
-      const key = info ? `${info.type}:${info.id}` : "";
-      const marks = `${settings.ratings}|${settings.newEpisodes}|${settings.animeTitles}|${episodes.version}`;
-      if (card.dataset.dxKey === key && card.dataset.dxWide === String(isWideRow(card)) && card.dataset.dxRatings === marks) continue;
+      const key = cardKey(card);
+      const wide = String(settings.wideContinue && continuing);
+      if (card.dataset.dxKey === key && card.dataset.dxWide === wide && card.dataset.dxRatings === marks) continue;
+      fresh = true;
       card.dataset.dxKey = key;
-      card.dataset.dxWide = String(isWideRow(card));
+      card.dataset.dxWide = wide;
       card.dataset.dxRatings = marks;
       if (IN_TV) {
         decorateLater.add(card);
@@ -1356,6 +1426,9 @@
       io.unobserve(card);
       io.observe(card);
     }
+    // What the addons know about the titles on screen: asked for again only when there are new ones
+    // to decorate (it reads several of Stremio's models whole)
+    if (fresh) coreMeta.refresh();
   }
 
   // TV: cards are decorated a few at a time while the stick is idle, top rows first. Watching each
@@ -1377,7 +1450,7 @@
         if (card.isConnected) decorate(card);
         if (++n === 12) break;
       }
-      if (this.queue.size) this.timer = (window.requestIdleCallback || setTimeout)(() => this.run(), { timeout: 300 });
+      if (this.queue.size) this.timer = idle(() => this.run(), 300);
     },
   };
 
@@ -1392,6 +1465,10 @@
     closeTimer: null,
     token: 0,
     library: { ids: new Set(), at: 0 },
+    // the title the open card covers, and the titles pushed aside for it: kept here, so closing
+    // (on every scrolled frame) never searches the page for them
+    covered: null,
+    pushed: new Set(),
 
     eligible(card) {
       if (!settings.previews) return false;
@@ -1727,7 +1804,8 @@
         if (inner) inner.style.clipPath = "inset(0 round 8px)";
         // the title's own poster steps out once the card has grown over it: its edges showed
         // around the card as a second, smaller frame
-        document.querySelectorAll("[data-dx-covered]").forEach((n) => { if (n !== card) n.removeAttribute("data-dx-covered"); });
+        if (this.covered && this.covered !== card) this.covered.removeAttribute("data-dx-covered");
+        this.covered = card;
         card.setAttribute("data-dx-covered", "");
         this.applyPushes(pushes);
         sfx.play("pop", 0.9);
@@ -1758,7 +1836,7 @@
     },
 
     applyPushes({ row, moves }) {
-      for (const n of document.querySelectorAll("[data-dx-pushed]")) {
+      for (const n of [...this.pushed]) {
         if (n.parentElement !== row) this.release(n);
       }
       // Rows snap to their titles. Pushing titles aside moves those snap points, so a row that had
@@ -1772,6 +1850,7 @@
       for (const [n, dx] of moves) {
         if (!dx) { if (n.dataset.dxPushed) this.release(n); continue; }
         n.dataset.dxPushed = "1";
+        this.pushed.add(n);
         n.style.transition = "transform .46s cubic-bezier(.2,.85,.25,1)";
         n.style.transform = `translate3d(${Math.round(dx)}px,0,0)`;
       }
@@ -1780,6 +1859,7 @@
     release(n) {
       n.style.transform = "";
       delete n.dataset.dxPushed;
+      this.pushed.delete(n);
       // drop the inline transition once they've glided back, and let the row snap again
       setTimeout(() => { if (!n.dataset.dxPushed) n.style.transition = ""; }, 500);
       const row = n.parentElement;
@@ -1794,7 +1874,7 @@
     },
 
     unpush() {
-      for (const n of document.querySelectorAll("[data-dx-pushed]")) this.release(n);
+      for (const n of [...this.pushed]) this.release(n);
     },
 
     wire(el) {
@@ -1820,9 +1900,10 @@
       trailer.stop();
       this.token++;
       if (this.card && this._leave) this.card.removeEventListener("mouseleave", this._leave);
-      document.querySelectorAll("[data-dx-covered]").forEach((n) => n.removeAttribute("data-dx-covered"));
+      if (this.covered) this.covered.removeAttribute("data-dx-covered");
+      this.covered = null;
       this.card = null;
-      this.unpush();
+      if (this.pushed.size) this.unpush();
       if (!this.el || !this.el.classList.contains("is-open")) return;
       const el = this.el;
       el.classList.remove("is-open");
@@ -1880,6 +1961,8 @@
     on: false,
     shield: null,
     from: null,
+    // the page changed since reach() last looked (set by the main observer and route changes)
+    stale: true,
 
     onKey: (e) => keyNav.key(e),
     onFocus: (e) => keyNav.focus(e),
@@ -1912,7 +1995,11 @@
       const entering = !this.on;
       if (entering) this.enter();
       this.clear();
-      this.reach();
+      // only when the page has changed since: it checks everything Stremio left out of reach
+      if (this.stale) {
+        this.stale = false;
+        this.reach();
+      }
       if (e.key === "Tab" || this.keeps(e.target, e.key)) return;
       // Start from the title the mouse was on, rather than wherever focus was left
       const focused = document.activeElement;
@@ -1933,7 +2020,7 @@
       // A row's See All (reached past its last title): Right stays, Left and Down go back to the
       // titles, Up to the row above
       const allRow = focused && focused.closest && focused.matches('[class*="see-all-container"]') && focused.closest('[class*="meta-row-container"]');
-      if (allRow && [...carouselRows()].includes(allRow) && this.DIRS[e.key]) {
+      if (allRow && allRow.matches(CAROUSEL_ROW) && this.DIRS[e.key]) {
         e.preventDefault();
         e.stopImmediatePropagation();
         if (e.key === "ArrowRight") return;
@@ -2070,12 +2157,7 @@
     // nearest() among what can be seen. Only the nearest few are checked for being covered: checking
     // every button on the page took a TV stick a fifth of a second per press.
     nearestSeen(focused, e, keep) {
-      const pool = this.inView(focused).filter(keep);
-      for (;;) {
-        const best = this.nearest(pool, focused, e);
-        if (!best || this.seen(best)) return best;
-        pool.splice(pool.indexOf(best), 1);
-      }
+      return this.ranked(this.inView(focused).filter(keep), focused, e).find((n) => this.seen(n)) || null;
     },
 
     // Stremio leaves much out of keyboard reach: its top bar (Home, Discover…, fullscreen,
@@ -2141,10 +2223,14 @@
 
     // The nearest of `items` from `here` in the key's direction
     nearest(items, here, e) {
+      return this.ranked(items, here, e)[0] || null;
+    },
+
+    // `items` that lie the key's way from `here`, nearest first (each one measured once)
+    ranked(items, here, e) {
       const [dx, dy] = this.DIRS[e.key];
       const a = here.getBoundingClientRect();
-      let best = null;
-      let bestScore = Infinity;
+      const scored = [];
       for (const n of items) {
         if (n === here) continue;
         const r = n.getBoundingClientRect();
@@ -2153,10 +2239,10 @@
         if (dx > 0 ? r.left < a.right - 4 : dx < 0 ? r.right > a.left + 4 : dy > 0 ? r.top < a.bottom - 4 : r.bottom > a.top + 4) continue;
         const along = Math.max(0, dx > 0 ? r.left - a.right : dx < 0 ? a.left - r.right : dy > 0 ? r.top - a.bottom : a.top - r.bottom);
         const across = dx ? Math.max(0, r.top - a.bottom, a.top - r.bottom) : Math.max(0, r.left - a.right, a.left - r.right);
-        const score = along + across * 3;
-        if (score < bestScore) { bestScore = score; best = n; }
+        scored.push([n, along + across * 3]);
       }
-      return best;
+      // (a stable sort: on a tie the earlier one wins, as before)
+      return scored.sort((x, y) => x[1] - y[1]).map(([n]) => n);
     },
 
     fromPreview(focused, e) {
@@ -2267,7 +2353,7 @@
         }
       }
       const row = track && track.parentElement && track.parentElement.closest('[class*="meta-row-container"]');
-      const carousel = row && [...carouselRows()].includes(row);
+      const carousel = row && row.matches(CAROUSEL_ROW);
       if (carousel) {
         if (dx) {
           const list = this.cards(track);
@@ -2328,15 +2414,16 @@
     // Into another row: the title nearest the one you were on, among those it shows
     toRow(row, x, e) {
       const track = row.querySelector(':scope > [class*="meta-items-container"]');
-      const list = this.cards(track);
       const v = this.view(track);
-      const shown = list.filter((n) => { const r = this.rest(n); return r.left >= v.left - 2 && r.right <= v.right + 2; });
-      const pool = shown.length ? shown : list;
+      // each title measured once (where it rests, which also reads its style)
+      const placed = this.cards(track).map((n) => [n, this.rest(n)]);
+      const shown = placed.filter(([, r]) => r.left >= v.left - 2 && r.right <= v.right + 2);
+      const pool = shown.length ? shown : placed;
       let pick = pool[0];
       if (x != null) {
-        for (const n of pool) if (Math.abs(this.rest(n).x - x) < Math.abs(this.rest(pick).x - x)) pick = n;
+        for (const p of pool) if (Math.abs(p[1].x - x) < Math.abs(pick[1].x - x)) pick = p;
       }
-      if (!this.go(pick, e)) return false;
+      if (!this.go(pick && pick[0], e)) return false;
       row.scrollIntoView({ block: "center", behavior: SCROLL });
       return true;
     },
@@ -2414,6 +2501,7 @@
     enter() {
       this.on = true;
       this.from = null;
+      this.stale = true;
       ensureExtrasStyle();
       this.looks();
       // A TV has no mouse to hide: and stepping the shield aside on every press redrew the whole
@@ -6397,9 +6485,24 @@
     }
   }
 
+  // A node dx.bi made (badges, captions, a row's arrows…): its first class is dx.bi's. Stremio's own
+  // parts that dx.bi only marks (a streams list made sortable) keep their own class first.
+  const isOwn = (n) => n.nodeType === 1 && typeof n.className === "string" && n.className.startsWith("dx");
+  // Only dx.bi's own nodes came or went (a badge put on a poster): nothing for the main loop to redo.
+  // Each one used to start another whole pass over the page, a dozen of them while Home first filled.
+  function ownChange(r) {
+    if (isOwn(r.target)) return true;
+    if (!r.addedNodes.length && !r.removedNodes.length) return false;
+    for (const n of r.addedNodes) if (!isOwn(n)) return false;
+    for (const n of r.removedNodes) if (!isOwn(n)) return false;
+    return true;
+  }
+
   const mo = new MutationObserver((records) => {
+    keyNav.stale = true;
     for (const r of records) {
       // Ignore changes we made ourselves
+      if (ownChange(r)) continue;
       if (r.target.closest && r.target.closest(".dx-hero, .dx-preview, .dx-row-pages, .dxe-airing, .dxe-upnext, .dxe-playhelp, .dxe-placeholder, .dxe-skip, .dxe-trailer, .dx-wide-art, .dx-player-title, .dx-player-flash, .dx-streambar, .dx-stream-empty, .dx-scrub, .dx-enhance-subs, .dx-player-toast, .dxp-nav-btn, .dxp-player-btn, .dxt-panel, .dx-sub2, .dxl-tools, .dxe-theatre, .dx-scores, .dx-reviews-btn")) continue;
       scheduleSync();
       // Library's watched filters hide titles in the same frame Stremio draws them (a whole sync
@@ -6415,7 +6518,7 @@
   };
   const onOver = (e) => preview.onOver(e);
   const onOut = (e) => preview.onOut(e);
-  const onHash = () => { document.body.classList.remove("dx-discover-picked"); updateRoute(); scheduleSync(); };
+  const onHash = () => { document.body.classList.remove("dx-discover-picked"); keyNav.stale = true; updateRoute(); scheduleSync(); };
 
   // Discover selects its first title by itself (for its side panel): it only shows as selected once
   // you've picked one
@@ -7862,6 +7965,7 @@
     data: {},
     dirty: new Set(),
     timer: null,
+    localTimer: null,
     ready: null,
 
     load() {
@@ -7894,12 +7998,20 @@
 
     set(key, value) {
       this.data[key] = { t: Date.now(), v: value };
-      this.saveLocal();
+      this.saveLocalSoon();
       this.dirty.add(key);
       this.schedule();
     },
 
+    // Every section is written out together (watch stats included): changes a moment apart share
+    // one write. flush() writes anything still waiting, as the app closes or goes to the background.
+    saveLocalSoon() {
+      if (!this.localTimer) this.localTimer = setTimeout(() => this.saveLocal(), 1000);
+    },
+
     saveLocal() {
+      clearTimeout(this.localTimer);
+      this.localTimer = null;
       try { localStorage.setItem(DATA_LOCAL, JSON.stringify(this.data)); } catch (_) { /* storage full: disk copy still saves */ }
     },
 
@@ -7909,6 +8021,7 @@
     },
 
     async flush() {
+      if (this.localTimer) this.saveLocal();
       const bridge = window.StremioEnhancedAPI;
       if (!bridge || typeof bridge.saveSetting !== "function") return;
       const keys = [...this.dirty];
@@ -8694,23 +8807,15 @@
         return;
       }
       episodes.refresh();
-      // One card per show: its next episode (or the one just out), with a count of the rest this week.
-      // The same show can sit in the library under several ids (Cinemeta, TMDB, Kitsu): keep one.
-      const byShow = new Map();
-      for (const [id, e] of episodes.index) {
-        const eps = e.upcoming || [];
-        if (!eps.length) continue;
-        const ep = eps[0];
-        const key = String(e.name || id).toLowerCase().replace(/[^a-z0-9]+/g, "");
-        const prev = byShow.get(key);
-        if (!prev || ep.t < prev.ep.t) byShow.set(key, { id, e, ep, more: eps.length - 1 });
+      // Built once per new set of episodes (the countdowns below are kept fresh on every pass)
+      if (!this.el || this.builtFor !== episodes.version) {
+        const items = this.items();
+        if (!items.length) {
+          this.remove();
+          return;
+        }
+        this.build(items.slice(0, 12));
       }
-      const items = [...byShow.values()].sort((a, b) => a.ep.t - b.ep.t);
-      if (!items.length) {
-        this.remove();
-        return;
-      }
-      if (!this.el || this.builtFor !== episodes.version) this.build(items.slice(0, 12));
       // after the billboard, before the first row
       const heroEl = host.querySelector(":scope > .dx-hero");
       if (heroEl) {
@@ -8723,6 +8828,21 @@
         const text = countdownText(+n.dataset.t);
         if (n.textContent !== text) n.textContent = text;
       });
+    },
+
+    items() {
+      // One card per show: its next episode (or the one just out), with a count of the rest this week.
+      // The same show can sit in the library under several ids (Cinemeta, TMDB, Kitsu): keep one.
+      const byShow = new Map();
+      for (const [id, e] of episodes.index) {
+        const eps = e.upcoming || [];
+        if (!eps.length) continue;
+        const ep = eps[0];
+        const key = String(e.name || id).toLowerCase().replace(/[^a-z0-9]+/g, "");
+        const prev = byShow.get(key);
+        if (!prev || ep.t < prev.ep.t) byShow.set(key, { id, e, ep, more: eps.length - 1 });
+      }
+      return [...byShow.values()].sort((a, b) => a.ep.t - b.ep.t);
     },
 
     build(items) {
@@ -10806,7 +10926,7 @@
     apply(lib, tools) {
       const cards = [...lib.querySelectorAll('[class*="meta-items-container"] > [class*="meta-item-container"]')];
       const p = this.prefs();
-      const ids = cards.map((c) => { const i = cardInfo(c); return i ? `${i.type}:${i.id}` : ""; });
+      const ids = cards.map(cardKey);
       const key = `${p.order}|${p.genre}|${ids.join(",")}|${this.info.size}`;
       if (key === this.key) return;
       this.key = key;
@@ -10875,8 +10995,8 @@
       const cards = [...lib.querySelectorAll('[class*="meta-items-container"] > [class*="meta-item-container"]')];
       let shown = 0;
       for (const c of cards) {
-        const info = cardInfo(c);
-        const watched = info ? this.flags.get(info.id) : undefined;
+        const key = cardKey(c);
+        const watched = key ? this.flags.get(key.slice(key.indexOf(":") + 1)) : undefined;
         // (until Stremio's answer first arrives, nothing: the wrong titles flashed up otherwise)
         const off = want !== null && (this.at === 0 || (watched !== undefined && watched !== want));
         c.classList.toggle("dxl-watch-off", off);
@@ -11228,7 +11348,10 @@
   function onLeave() {
     stats.flush();
     store.flush();
+    saveCached();
   }
+  // A TV app is rarely closed: it's sent to the background, then ended by the system without a word
+  const onHidden = () => { if (document.hidden) onLeave(); };
 
   function start() {
     // Windows needs a few rendering workarounds in the theme (see "WINDOWS" there)
@@ -11250,6 +11373,7 @@
     window.addEventListener("hashchange", onHash);
     window.addEventListener("resize", onResize);
     document.addEventListener("visibilitychange", onHash);
+    document.addEventListener("visibilitychange", onHidden);
     document.addEventListener("click", onSoundClick, true);
     document.addEventListener("pointerdown", onDiscoverPick, true);
     document.addEventListener("keydown", onDiscoverPick, true);
@@ -11355,6 +11479,7 @@
       window.removeEventListener("hashchange", onHash);
       window.removeEventListener("resize", onResize);
       document.removeEventListener("visibilitychange", onHash);
+      document.removeEventListener("visibilitychange", onHidden);
       document.removeEventListener("click", onSoundClick, true);
       document.removeEventListener("pointerdown", onDiscoverPick, true);
       document.removeEventListener("keydown", onDiscoverPick, true);

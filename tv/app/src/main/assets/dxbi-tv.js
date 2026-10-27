@@ -607,19 +607,35 @@
     }, 100);
   }
 
-  function onRoute() {
+  // The Settings entry is looked for as Stremio draws Settings: only while Settings is open, rather
+  // than on every change anywhere in the app
+  let settingsWatch = null;
+  function watchSettings() {
+    const on = /^#\/settings/.test(location.hash);
+    if (on && !settingsWatch && document.body) {
+      settingsWatch = new MutationObserver(ensureSettingsEntry);
+      settingsWatch.observe(document.body, { childList: true, subtree: true });
+    } else if (!on && settingsWatch) {
+      settingsWatch.disconnect();
+      settingsWatch = null;
+    }
     ensureSettingsEntry();
+  }
+
+  function onRoute() {
+    watchSettings();
     if (/^#\/player\//.test(location.hash)) startHandoff();
     if (/^#\/search\?search=./.test(location.hash) && document.activeElement && document.activeElement.tagName !== "INPUT") resultsFirst();
   }
 
   window.addEventListener("hashchange", onRoute);
+  // (dx.bi's own links change the address without a hashchange)
+  window.addEventListener("popstate", watchSettings);
   const start = () => {
     ensureStyle();
     loadPlugin();
     resumePlayback();
     onRoute();
-    new MutationObserver(ensureSettingsEntry).observe(document.body, { childList: true, subtree: true });
   };
   if (document.readyState === "complete") start();
   else window.addEventListener("load", start);

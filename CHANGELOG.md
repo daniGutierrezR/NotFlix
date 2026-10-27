@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.17.1
+- **Smoother everywhere, and most of all on TVs.** dx.bi no longer redoes its whole pass over the page each time it puts a badge or caption on a poster, a scrolling row no longer searches the page every frame, the remote's presses do less work, and saved data is written while the app is idle.
+- **dx.bi TV: new icon and banner** on the TV's home screen.
+
 ## 2.17.0
 - **dx.bi TV is much smoother.** Tested on a Fire TV Stick 4K: moving down Home's rows went from about 15 to 40 frames a second, sideways from about 45 to 56, and the long freezes (up to a second and a half) are gone. The first trip down Home no longer stalls while rows load, and pressing towards an edge with nothing there no longer hangs for half a second.
 - **dx.bi TV: hover cards are back on by default.** A card opens when a title stays selected for a moment, and on TVs it fades in rather than unfolding. Switch it off in dx.bi settings → Hover cards & trailers.
